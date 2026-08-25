@@ -162,6 +162,15 @@ avoids the API rate limits (HTTP 429) that previously caused `Failed to get
 device status` errors. On an expired/invalid token you will see a clear HTTP
 401 message in the log instead.
 
+## Temperature units
+
+HomeKit always works in Celsius, while a SmartThings device reports its readings in whatever unit
+it is set to. The plugin reads the unit from the device status and converts as needed, so a unit
+set to Fahrenheit no longer shows its 72 °F as 72 °C: temperatures arrive in Celsius and a
+setpoint you choose in the Home app goes back out in Fahrenheit. The thermostat also reports the
+device's own unit as its display preference, so apps that honour it show the same scale as the AC.
+No configuration is needed.
+
 ## Supported Modes
 - `off`
 - `cool`
