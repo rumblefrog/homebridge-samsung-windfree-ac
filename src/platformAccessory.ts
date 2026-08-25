@@ -15,9 +15,13 @@ enum SwitchState {
   Off = 'off'
 }
 
+// The unit a device reports its temperatures in, as SmartThings spells it on
+// every temperature attribute. HomeKit's temperature characteristics are always
+// Celsius, so a Fahrenheit device needs converting on the way in and back again
+// on the way out.
 enum TemperatureUnit {
   Celsius = 'C',
-  Farenheit = 'F'
+  Fahrenheit = 'F'
 }
 
 enum AirConditionerOptionalMode {
@@ -94,6 +98,9 @@ export class AirConditionerPlatformAccessory {
   private swingHorizontalService?: Service;
   private autoCleanService?: Service;
 
+  // Unit the device reports in, learned from its status. Only decides the
+  // display preference handed to HomeKit — the values themselves are always
+  // converted to Celsius. Assumed Celsius until a status says otherwise.
   private temperatureUnit: TemperatureUnit = TemperatureUnit.Celsius;
 
   // Whether the unit reports its own display state. When it does the reported
@@ -788,7 +795,11 @@ export class AirConditionerPlatformAccessory {
   private handleTemperatureDisplayUnitsGet(): CharacteristicValue {
     this.platform.log.debug('Triggered GET TemperatureDisplayUnits');
 
-    return this.temperatureUnit === TemperatureUnit.Celsius
+    return this.displayUnitsFor(this.temperatureUnit);
+  }
+
+  private displayUnitsFor(unit: TemperatureUnit): CharacteristicValue {
+    return unit === TemperatureUnit.Celsius
       ? this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS
       : this.platform.Characteristic.TemperatureDisplayUnits.FAHRENHEIT;
   }
@@ -864,11 +875,15 @@ export class AirConditionerPlatformAccessory {
   private async handleTargetTemperatureSet(value: CharacteristicValue) {
     this.platform.log.debug('Triggered SET TargetTemperature:', value);
 
+    // `setCoolingSetpoint` carries no unit, so the number has to be in whatever
+    // unit the device works in. HomeKit only ever hands over Celsius.
+    const setpoint = this.toDeviceTemperature(Number(value));
+
     await this.runCommands('TargetTemperature', [
       {
         capability: 'thermostatCoolingSetpoint',
         command: 'setCoolingSetpoint',
-        arguments: [value],
+        arguments: [setpoint],
       },
     ]);
   }
@@ -893,9 +908,9 @@ export class AirConditionerPlatformAccessory {
     } else if (airConditionerMode === AirConditionerMode.Cool) {
       return currentHeatingCoolingState.COOL;
     } else if (airConditionerMode === AirConditionerMode.Auto) {
-      const coolingSetpoint = this.readAttr(status, 'thermostatCoolingSetpoint', 'coolingSetpoint');
-      const temperature = this.readAttr(status, 'temperatureMeasurement', 'temperature');
-      if (typeof coolingSetpoint !== 'number' || typeof temperature !== 'number') {
+      const coolingSetpoint = this.readTemperature(status, 'thermostatCoolingSetpoint', 'coolingSetpoint');
+      const temperature = this.readTemperature(status, 'temperatureMeasurement', 'temperature');
+      if (coolingSetpoint === undefined || temperature === undefined) {
         return currentHeatingCoolingState.COOL;
       }
       return temperature > coolingSetpoint ? currentHeatingCoolingState.COOL : currentHeatingCoolingState.HEAT;
@@ -929,13 +944,11 @@ export class AirConditionerPlatformAccessory {
   }
 
   private computeCurrentTemperature(status: DeviceStatus): CharacteristicValue | undefined {
-    const temperature = this.readAttr(status, 'temperatureMeasurement', 'temperature');
-    return typeof temperature === 'number' ? temperature : undefined;
+    return this.readTemperature(status, 'temperatureMeasurement', 'temperature');
   }
 
   private computeTargetTemperature(status: DeviceStatus): CharacteristicValue | undefined {
-    const temperature = this.readAttr(status, 'thermostatCoolingSetpoint', 'coolingSetpoint');
-    return typeof temperature === 'number' ? temperature : undefined;
+    return this.readTemperature(status, 'thermostatCoolingSetpoint', 'coolingSetpoint');
   }
 
   private computeCurrentRelativeHumidity(status: DeviceStatus): CharacteristicValue | undefined {
@@ -1138,6 +1151,73 @@ export class AirConditionerPlatformAccessory {
   /** Reads `status[capability][attribute].value`, tolerating missing pieces. */
   private readAttr(status: DeviceStatus | null, capability: string, attribute: string): unknown {
     return status?.[capability]?.[attribute]?.value;
+  }
+
+  /** The unit an attribute is reported in, or `undefined` when it does not say. */
+  private readAttrUnit(status: DeviceStatus | null, capability: string, attribute: string): TemperatureUnit | undefined {
+    const unit = status?.[capability]?.[attribute]?.unit;
+    return unit === TemperatureUnit.Celsius || unit === TemperatureUnit.Fahrenheit ? unit : undefined;
+  }
+
+  /**
+   * Reads a temperature attribute and converts it to Celsius, the only unit
+   * HomeKit's temperature characteristics accept. A device set to Fahrenheit
+   * reports Fahrenheit numbers, so without this a 72 degree reading reaches
+   * HomeKit as 72 degrees Celsius.
+   *
+   * Falls back to the unit the device last reported for an attribute that
+   * carries no unit of its own.
+   */
+  private readTemperature(status: DeviceStatus | null, capability: string, attribute: string): number | undefined {
+    const value = this.readAttr(status, capability, attribute);
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return undefined;
+    }
+
+    const unit = this.readAttrUnit(status, capability, attribute) ?? this.temperatureUnit;
+    if (unit !== TemperatureUnit.Fahrenheit) {
+      return value;
+    }
+
+    // Rounded to the tenth of a degree the characteristics step in, so the
+    // value HomeKit stores is the one it can actually represent.
+    return Math.round((value - 32) * 5 / 9 * 10) / 10;
+  }
+
+  /**
+   * Converts a HomeKit temperature back into the unit the device works in.
+   * A Fahrenheit setpoint is rounded to a whole degree: that is the grid the AC
+   * steps on, so anything finer is discarded by the unit anyway and would only
+   * make the value read back differ from the one we sent.
+   */
+  private toDeviceTemperature(celsius: number): number {
+    return this.temperatureUnit === TemperatureUnit.Fahrenheit
+      ? Math.round(celsius * 9 / 5 + 32)
+      : celsius;
+  }
+
+  /**
+   * Tracks the unit the device reports in, so the display preference offered to
+   * HomeKit matches what the AC itself shows and setpoints go back out in the
+   * unit it expects. The values are converted to Celsius either way.
+   */
+  private syncTemperatureUnit(status: DeviceStatus): void {
+    const unit =
+      this.readAttrUnit(status, 'thermostatCoolingSetpoint', 'coolingSetpoint')
+      ?? this.readAttrUnit(status, 'temperatureMeasurement', 'temperature');
+
+    if (unit === undefined || unit === this.temperatureUnit) {
+      return;
+    }
+
+    this.platform.log.debug(
+      unit === TemperatureUnit.Fahrenheit
+        ? 'Device reports temperatures in Fahrenheit; converting to Celsius for HomeKit'
+        : 'Device reports temperatures in Celsius',
+    );
+
+    this.temperatureUnit = unit;
+    this.service.updateCharacteristic(this.platform.Characteristic.TemperatureDisplayUnits, this.displayUnitsFor(unit));
   }
 
   /** Throws a clean HAP communication error when data is unavailable. */
@@ -1495,6 +1575,7 @@ export class AirConditionerPlatformAccessory {
       return this.cachedStatus;
     }
 
+    this.syncTemperatureUnit(main);
     this.cachedStatus = main;
     this.statusFetchedAt = Date.now();
     this.backoffUntil = 0;
